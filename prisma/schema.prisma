@@ -1,0 +1,547 @@
+// Machine Order Tracker — relational data model (PostgreSQL)
+//
+// Design notes
+// * Orders are never hard-deleted (CANCELLED/CLOSED instead); child rows use Restrict.
+// * daily_updates and audit_logs are append-only: DB triggers (see migrations) reject UPDATE/DELETE.
+// * order_number is assigned when a PO is approved (ORD-YYYY-NNNN) from order_sequences.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  ENGINEER
+}
+
+enum OrderStatus {
+  PO_RECEIVED
+  PO_UNDER_REVIEW
+  ORDER_CREATED
+  ASSIGNED
+  ACCEPTED
+  ASSEMBLY_IN_PROGRESS
+  TESTING
+  COMPLETED
+  PHOTOS_UPLOADED
+  PACKED
+  READY_FOR_DISPATCH
+  DISPATCHED
+  CLOSED
+  ON_HOLD
+  CANCELLED
+}
+
+enum OrderSource {
+  GMAIL
+  MANUAL
+}
+
+enum StagePhase {
+  ASSEMBLY
+  TESTING
+  FINAL
+}
+
+enum StageStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+}
+
+enum ExtractionStatus {
+  SUCCESS
+  PARTIAL
+  FAILED
+  MANUAL
+}
+
+enum DuplicateStatus {
+  NONE
+  SUSPECTED
+  IGNORED
+  MERGED
+  OVERRIDDEN
+}
+
+enum DocumentKind {
+  PO_ATTACHMENT
+  OTHER
+}
+
+enum ImageKind {
+  MACHINE
+  PROGRESS
+}
+
+enum NotificationChannel {
+  WHATSAPP
+  EMAIL
+}
+
+enum DeliveryStatus {
+  PENDING
+  SENT
+  FAILED
+  SKIPPED
+}
+
+enum LogLevel {
+  INFO
+  WARN
+  ERROR
+}
+
+enum GmailConnectionStatus {
+  CONNECTED
+  ERROR
+  DISCONNECTED
+}
+
+enum GmailMessageResult {
+  IMPORTED
+  SKIPPED
+  DUPLICATE
+  ERROR
+}
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  phone        String?
+  passwordHash String   @map("password_hash")
+  role         Role
+  active       Boolean  @default(true)
+  isDemo       Boolean  @default(false) @map("is_demo")
+  lastLoginAt  DateTime? @map("last_login_at")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  assignedOrders     Order[]             @relation("OrderEngineer")
+  dailyUpdates       DailyUpdate[]
+  uploadedImages     OrderImage[]
+  uploadedDocuments  Document[]
+  auditLogs          AuditLog[]
+  inAppNotifications InAppNotification[]
+  stageUpdates       OrderStageProgress[]
+  orderNotes         OrderNote[]
+  packedDispatches   Dispatch[]          @relation("PackedBy")
+  readyDispatches    Dispatch[]          @relation("ReadyBy")
+  shippedDispatches  Dispatch[]          @relation("DispatchedBy")
+
+  @@index([role, active])
+  @@map("users")
+}
+
+model Customer {
+  id              String   @id @default(cuid())
+  name            String
+  billingAddress  String?  @map("billing_address")
+  shippingAddress String?  @map("shipping_address")
+  contactPerson   String?  @map("contact_person")
+  email           String?
+  phone           String?
+  // Lower-cased email domain used to match incoming PO senders (e.g. "abchospital.com")
+  emailDomain     String?  @map("email_domain")
+  isDemo          Boolean  @default(false) @map("is_demo")
+  createdAt       DateTime @default(now()) @map("created_at")
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  orders Order[]
+
+  @@index([name])
+  @@index([emailDomain])
+  @@map("customers")
+}
+
+model OrderSequence {
+  year      Int @id
+  lastValue Int @default(0) @map("last_value")
+
+  @@map("order_sequences")
+}
+
+model Order {
+  id                     String       @id @default(cuid())
+  orderNumber            String?      @unique @map("order_number")
+  source                 OrderSource  @default(MANUAL)
+  customerId             String?      @map("customer_id")
+  // PO information
+  poNumber               String?      @map("po_number")
+  poDate                 DateTime?    @map("po_date") @db.Date
+  deliveryDate           DateTime?    @map("delivery_date") @db.Date
+  paymentTerms           String?      @map("payment_terms")
+  referenceNumber        String?      @map("reference_number")
+  // Machine information
+  machineName            String?      @map("machine_name")
+  machineModel           String?      @map("machine_model")
+  quantity               Int?
+  specifications         String?
+  specialInstructions    String?      @map("special_instructions")
+  // Commercial information
+  unitPrice              Decimal?     @map("unit_price") @db.Decimal(14, 2)
+  totalValue             Decimal?     @map("total_value") @db.Decimal(14, 2)
+  tax                    Decimal?     @db.Decimal(14, 2)
+  currency               String?
+  // Production
+  engineerId             String?      @map("engineer_id")
+  status                 OrderStatus  @default(PO_RECEIVED)
+  statusBeforeHold       OrderStatus? @map("status_before_hold")
+  holdReason             String?      @map("hold_reason")
+  cancelReason           String?      @map("cancel_reason")
+  currentStageId         String?      @map("current_stage_id")
+  progressPercentage     Int          @default(0) @map("progress_percentage")
+  expectedCompletionDate DateTime?    @map("expected_completion_date") @db.Date
+  approvedAt             DateTime?    @map("approved_at")
+  assignedAt             DateTime?    @map("assigned_at")
+  acceptedAt             DateTime?    @map("accepted_at")
+  completedAt            DateTime?    @map("completed_at")
+  completionRemarks      String?      @map("completion_remarks")
+  photosSubmittedAt      DateTime?    @map("photos_submitted_at")
+  lastUpdateAt           DateTime?    @map("last_update_at")
+  lastOverdueAlertOn     DateTime?    @map("last_overdue_alert_on") @db.Date
+  isDemo                 Boolean      @default(false) @map("is_demo")
+  createdAt              DateTime     @default(now()) @map("created_at")
+  updatedAt              DateTime     @updatedAt @map("updated_at")
+
+  customer       Customer?            @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  engineer       User?                @relation("OrderEngineer", fields: [engineerId], references: [id], onDelete: Restrict)
+  currentStage   AssemblyStage?       @relation(fields: [currentStageId], references: [id], onDelete: Restrict)
+  purchaseOrders PurchaseOrder[]      @relation("OrderPurchaseOrders")
+  duplicateOf    PurchaseOrder[]      @relation("DuplicateTarget")
+  stageProgress  OrderStageProgress[]
+  dailyUpdates   DailyUpdate[]
+  images         OrderImage[]
+  documents      Document[]
+  notifications  Notification[]
+  auditLogs      AuditLog[]
+  inAppNotifications InAppNotification[]
+  notes          OrderNote[]
+  dispatch       Dispatch?
+
+  @@index([status])
+  @@index([engineerId, status])
+  @@index([customerId])
+  @@index([poNumber])
+  @@index([expectedCompletionDate])
+  @@index([lastUpdateAt])
+  @@map("orders")
+}
+
+model PurchaseOrder {
+  id                String           @id @default(cuid())
+  orderId           String           @map("order_id")
+  source            OrderSource      @default(GMAIL)
+  gmailMessageId    String?          @unique @map("gmail_message_id")
+  gmailThreadId     String?          @map("gmail_thread_id")
+  sender            String?
+  senderEmail       String?          @map("sender_email")
+  subject           String?
+  receivedAt        DateTime?        @map("received_at")
+  bodyText          String?          @map("body_text")
+  extractedData     Json?            @map("extracted_data")
+  extractionStatus  ExtractionStatus @default(MANUAL) @map("extraction_status")
+  extractionWarnings String[]        @default([]) @map("extraction_warnings")
+  duplicateStatus   DuplicateStatus  @default(NONE) @map("duplicate_status")
+  duplicateReasons  String[]         @default([]) @map("duplicate_reasons")
+  duplicateOfOrderId String?         @map("duplicate_of_order_id")
+  createdAt         DateTime         @default(now()) @map("created_at")
+
+  order       Order      @relation("OrderPurchaseOrders", fields: [orderId], references: [id], onDelete: Restrict)
+  duplicateOf Order?     @relation("DuplicateTarget", fields: [duplicateOfOrderId], references: [id], onDelete: SetNull)
+  documents   Document[]
+
+  @@index([orderId])
+  @@index([senderEmail])
+  @@index([duplicateStatus])
+  @@map("purchase_orders")
+}
+
+model Document {
+  id              String       @id @default(cuid())
+  orderId         String       @map("order_id")
+  purchaseOrderId String?      @map("purchase_order_id")
+  kind            DocumentKind @default(OTHER)
+  fileName        String       @map("file_name")
+  mimeType        String       @map("mime_type")
+  size            Int
+  storageKey      String       @map("storage_key")
+  sha256          String
+  uploadedById    String?      @map("uploaded_by")
+  createdAt       DateTime     @default(now()) @map("created_at")
+
+  order         Order          @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  purchaseOrder PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id], onDelete: SetNull)
+  uploadedBy    User?          @relation(fields: [uploadedById], references: [id], onDelete: SetNull)
+
+  @@index([orderId])
+  @@index([sha256])
+  @@map("documents")
+}
+
+model AssemblyStage {
+  id        String     @id @default(cuid())
+  name      String     @unique
+  sequence  Int
+  phase     StagePhase @default(ASSEMBLY)
+  // Default progress % suggested when an engineer moves into this stage
+  defaultProgress Int  @default(0) @map("default_progress")
+  active    Boolean    @default(true)
+  createdAt DateTime   @default(now()) @map("created_at")
+  updatedAt DateTime   @updatedAt @map("updated_at")
+
+  progress      OrderStageProgress[]
+  dailyUpdates  DailyUpdate[]
+  currentOrders Order[]
+
+  @@index([active, sequence])
+  @@map("assembly_stages")
+}
+
+model OrderStageProgress {
+  id          String      @id @default(cuid())
+  orderId     String      @map("order_id")
+  stageId     String      @map("stage_id")
+  status      StageStatus @default(PENDING)
+  startedAt   DateTime?   @map("started_at")
+  completedAt DateTime?   @map("completed_at")
+  notes       String?
+  updatedById String?     @map("updated_by")
+  updatedAt   DateTime    @updatedAt @map("updated_at")
+
+  order     Order         @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  stage     AssemblyStage @relation(fields: [stageId], references: [id], onDelete: Restrict)
+  updatedBy User?         @relation(fields: [updatedById], references: [id], onDelete: SetNull)
+
+  @@unique([orderId, stageId])
+  @@map("order_stage_progress")
+}
+
+/// Append-only: UPDATE/DELETE rejected by trigger.
+model DailyUpdate {
+  id                 String   @id @default(cuid())
+  orderId            String   @map("order_id")
+  engineerId         String   @map("engineer_id")
+  updateDate         DateTime @map("update_date") @db.Date
+  stageId            String   @map("stage_id")
+  previousStageId    String?  @map("previous_stage_id")
+  progress           Int
+  workCompleted      String   @map("work_completed")
+  issues             String?
+  expectedDelayDays  Int?     @map("expected_delay_days")
+  materialRequired   String?  @map("material_required")
+  nextStep           String?  @map("next_step")
+  expectedCompletion DateTime? @map("expected_completion") @db.Date
+  createdAt          DateTime @default(now()) @map("created_at")
+
+  order    Order         @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  engineer User          @relation(fields: [engineerId], references: [id], onDelete: Restrict)
+  stage    AssemblyStage @relation(fields: [stageId], references: [id], onDelete: Restrict)
+  images   OrderImage[]
+
+  @@index([orderId, createdAt])
+  @@index([engineerId, updateDate])
+  @@map("daily_updates")
+}
+
+model OrderImage {
+  id            String    @id @default(cuid())
+  orderId       String    @map("order_id")
+  dailyUpdateId String?   @map("daily_update_id")
+  kind          ImageKind @default(MACHINE)
+  uploadedById  String    @map("uploaded_by")
+  storageKey    String    @map("storage_key")
+  fileName      String    @map("file_name")
+  mimeType      String    @map("mime_type")
+  size          Int
+  width         Int?
+  height        Int?
+  createdAt     DateTime  @default(now()) @map("created_at")
+
+  order       Order        @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  dailyUpdate DailyUpdate? @relation(fields: [dailyUpdateId], references: [id], onDelete: Restrict)
+  uploadedBy  User         @relation(fields: [uploadedById], references: [id], onDelete: Restrict)
+
+  @@index([orderId, kind])
+  @@map("order_images")
+}
+
+/// Outbound notification outbox (WhatsApp / email). Every attempt is visible and retryable.
+model Notification {
+  id                String              @id @default(cuid())
+  orderId           String?             @map("order_id")
+  type              String
+  channel           NotificationChannel
+  recipient         String
+  subject           String?
+  message           String
+  payload           Json?
+  status            DeliveryStatus      @default(PENDING)
+  attempts          Int                 @default(0)
+  providerMessageId String?             @map("provider_message_id")
+  sentAt            DateTime?           @map("sent_at")
+  error             String?
+  createdAt         DateTime            @default(now()) @map("created_at")
+  updatedAt         DateTime            @updatedAt @map("updated_at")
+
+  order Order? @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  @@index([status, channel])
+  @@index([orderId])
+  @@index([createdAt])
+  @@map("notifications")
+}
+
+/// In-app notification center entries.
+model InAppNotification {
+  id        String    @id @default(cuid())
+  userId    String    @map("user_id")
+  orderId   String?   @map("order_id")
+  type      String
+  title     String
+  message   String
+  link      String?
+  readAt    DateTime? @map("read_at")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user  User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  order Order? @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  @@index([userId, readAt])
+  @@index([createdAt])
+  @@map("in_app_notifications")
+}
+
+/// Append-only: UPDATE/DELETE rejected by trigger.
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?  @map("user_id")
+  userName   String?  @map("user_name")
+  userRole   String?  @map("user_role")
+  action     String
+  orderId    String?  @map("order_id")
+  entityType String?  @map("entity_type")
+  entityId   String?  @map("entity_id")
+  summary    String
+  oldValue   Json?    @map("old_value")
+  newValue   Json?    @map("new_value")
+  ipAddress  String?  @map("ip_address")
+  userAgent  String?  @map("user_agent")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  user  User?  @relation(fields: [userId], references: [id], onDelete: Restrict)
+  order Order? @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  @@index([orderId, createdAt])
+  @@index([userId, createdAt])
+  @@index([action])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+model OrderNote {
+  id        String   @id @default(cuid())
+  orderId   String   @map("order_id")
+  authorId  String   @map("author_id")
+  body      String
+  createdAt DateTime @default(now()) @map("created_at")
+
+  order  Order @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  author User  @relation(fields: [authorId], references: [id], onDelete: Restrict)
+
+  @@index([orderId, createdAt])
+  @@map("order_notes")
+}
+
+model Dispatch {
+  id                String    @id @default(cuid())
+  orderId           String    @unique @map("order_id")
+  packedAt          DateTime? @map("packed_at")
+  packedById        String?   @map("packed_by")
+  packedByName      String?   @map("packed_by_name")
+  packingRemarks    String?   @map("packing_remarks")
+  packageCount      Int?      @map("package_count")
+  packageDimensions String?   @map("package_dimensions")
+  weightKg          Decimal?  @map("weight_kg") @db.Decimal(10, 2)
+  readyAt           DateTime? @map("ready_at")
+  readyById         String?   @map("ready_by")
+  dispatchedAt      DateTime? @map("dispatched_at")
+  dispatchedById    String?   @map("dispatched_by")
+  courier           String?
+  transporter       String?
+  trackingNumber    String?   @map("tracking_number")
+  vehicleNumber     String?   @map("vehicle_number")
+  dispatchRemarks   String?   @map("dispatch_remarks")
+  closedAt          DateTime? @map("closed_at")
+  createdAt         DateTime  @default(now()) @map("created_at")
+  updatedAt         DateTime  @updatedAt @map("updated_at")
+
+  order        Order @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  packedBy     User? @relation("PackedBy", fields: [packedById], references: [id], onDelete: SetNull)
+  readyBy      User? @relation("ReadyBy", fields: [readyById], references: [id], onDelete: SetNull)
+  dispatchedBy User? @relation("DispatchedBy", fields: [dispatchedById], references: [id], onDelete: SetNull)
+
+  @@map("dispatch")
+}
+
+/// Key/value application settings (company, whatsapp, email, gmail rules...). Values validated with zod.
+model Setting {
+  key       String   @id
+  value     Json
+  updatedAt DateTime @updatedAt @map("updated_at")
+  updatedBy String?  @map("updated_by")
+
+  @@map("settings")
+}
+
+/// Single connected Gmail mailbox (id = "primary"). Tokens are AES-256-GCM encrypted.
+model GmailConnection {
+  id                    String                @id @default("primary")
+  email                 String
+  encryptedRefreshToken String                @map("encrypted_refresh_token")
+  encryptedAccessToken  String?               @map("encrypted_access_token")
+  accessTokenExpiresAt  DateTime?             @map("access_token_expires_at")
+  scopes                String?
+  historyId             String?               @map("history_id")
+  watchExpiration       DateTime?             @map("watch_expiration")
+  status                GmailConnectionStatus @default(CONNECTED)
+  lastError             String?               @map("last_error")
+  lastSyncAt            DateTime?             @map("last_sync_at")
+  connectedById         String?               @map("connected_by")
+  createdAt             DateTime              @default(now()) @map("created_at")
+  updatedAt             DateTime              @updatedAt @map("updated_at")
+
+  @@map("gmail_connections")
+}
+
+/// Every Gmail message examined — guarantees a message is never processed twice.
+model GmailProcessedMessage {
+  messageId       String             @id @map("message_id")
+  threadId        String?            @map("thread_id")
+  result          GmailMessageResult
+  reason          String?
+  purchaseOrderId String?            @map("purchase_order_id")
+  processedAt     DateTime           @default(now()) @map("processed_at")
+
+  @@index([processedAt])
+  @@map("gmail_processed_messages")
+}
+
+model SystemLog {
+  id        String   @id @default(cuid())
+  level     LogLevel
+  source    String
+  message   String
+  context   Json?
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([level, createdAt])
+  @@index([source, createdAt])
+  @@map("system_logs")
+}
