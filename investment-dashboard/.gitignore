@@ -1,0 +1,9 @@
+# Personal financial data never gets committed
+data/*
+!data/inbox/
+data/inbox/*
+!data/inbox/.gitkeep
+.env
+__pycache__/
+*.pyc
+.pytest_cache/

@@ -1,0 +1,7 @@
+casparser>=1.4
+streamlit>=1.40
+plotly>=5.20
+pandas>=2.1
+openpyxl>=3.1
+requests>=2.31
+pytest>=8.0
